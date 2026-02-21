@@ -125,6 +125,39 @@ const GENIUS_PAIR_LABELS = {
   WG_I_WG_W: "Opportunity Inventor"
 };
 
+const STRENGTH_KEY_ALIASES = {
+  executing: "EXEC",
+  execution: "EXEC",
+  achiever: "EXEC",
+  discipline: "EXEC",
+  responsibility: "EXEC",
+  influencing: "INFL",
+  influence: "INFL",
+  communication: "INFL",
+  woo: "INFL",
+  relator: "REL",
+  empathy: "REL",
+  developer: "REL",
+  relationship: "REL",
+  "relationship building": "REL",
+  strategic: "STRAT",
+  "strategic thinking": "STRAT",
+  intellection: "STRAT",
+  learner: "STRAT",
+  ideation: "STRAT"
+};
+
+const GENIUS_KEY_ALIASES = {
+  wonder: "WG_W",
+  invention: "WG_I",
+  invent: "WG_I",
+  discernment: "WG_D",
+  galvanizing: "WG_G",
+  galvanizer: "WG_G",
+  enablement: "WG_E",
+  tenacity: "WG_T"
+};
+
 const TOTAL_QUESTIONS = QUESTION_KEY.length;
 const MAX_LIMIT = 5000;
 const MAX_NAME_LEN = 120;
@@ -132,7 +165,7 @@ const MAX_TEST_VERSION_LEN = 60;
 const REQUIRE_SUBMISSION_API_KEY = parseBoolEnv("REQUIRE_SUBMISSION_API_KEY", false);
 const RATE_WINDOW_MS = Number(process.env.RATE_WINDOW_MS || 10 * 60 * 1000);
 const RATE_MAX_SUBMISSIONS = Number(process.env.RATE_MAX_SUBMISSIONS || 30);
-const RATE_MAX_ADMIN = Number(process.env.RATE_MAX_ADMIN || 120);
+const RATE_MAX_ADMIN = Number(process.env.RATE_MAX_ADMIN || process.env.RATE_MAX_FEEDBACK || 120);
 const RATE_BUCKETS = new Map();
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i;
@@ -201,7 +234,7 @@ app.post("/api/submissions", async (req, res) => {
     enforceSubmissionAccess(req);
 
     const submission = validateSubmission(req.body);
-    const profile = scoreProfile(submission.answers, submission.durationMinutes);
+    const profile = scoreProfile(submission.answers, submission.durationMinutes, submission.knownAssessments);
 
     const record = {
       submissionId: createSubmissionId(),
@@ -322,6 +355,7 @@ function validateSubmission(input) {
   const durationMinutes = Number(body.durationMinutes || 0);
   const autoSubmitted = Boolean(body.autoSubmitted);
   const testVersion = normalizeTestVersion(String(body.testVersion || DEFAULT_TEST_VERSION).trim());
+  const knownAssessments = normalizeKnownAssessments(body.knownAssessments || {});
 
   if (!candidateName) fail(400, "Missing candidateName");
   if (candidateName.length > MAX_NAME_LEN) fail(400, "candidateName is too long");
@@ -354,11 +388,12 @@ function validateSubmission(input) {
     autoSubmitted,
     testVersion,
     answers,
+    knownAssessments,
     roleLabel: PROFILE_LABEL
   };
 }
 
-function scoreProfile(answers, durationMinutes) {
+function scoreProfile(answers, durationMinutes, knownAssessments) {
   const traitTotals = buildTraitTotals();
   let answeredCount = 0;
 
@@ -463,6 +498,7 @@ function scoreProfile(answers, durationMinutes) {
   };
 
   profile.interpretation = deriveInterpretation(profile);
+  profile.calibration = deriveCalibration(profile, knownAssessments);
   return profile;
 }
 
@@ -621,6 +657,198 @@ function buildPairKey(a, b) {
   return [String(a || ""), String(b || "")].sort().join("_");
 }
 
+function normalizeKnownAssessments(input) {
+  const raw = input || {};
+  const strengths = parseCommaList(raw.strengths).slice(0, 8);
+  const workingGenius = parseCommaList(raw.workingGenius ?? raw.genius).slice(0, 8);
+
+  return {
+    mbti: String(raw.mbti || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 4),
+    disc: String(raw.disc || "").toUpperCase().replace(/[^-A-Z/ ]/g, "").slice(0, 24),
+    strengths,
+    workingGenius
+  };
+}
+
+function parseCommaList(value) {
+  if (Array.isArray(value)) {
+    return value.map((x) => String(x || "").trim()).filter(Boolean);
+  }
+
+  return String(value || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function deriveCalibration(profile, knownAssessments) {
+  const known = normalizeKnownAssessments(knownAssessments);
+  const hasKnown = Boolean(known.mbti || known.disc || known.strengths.length || known.workingGenius.length);
+
+  if (!hasKnown) {
+    return {
+      hasKnown: false,
+      known,
+      mbtiMatch: null,
+      discMatch: null,
+      strengthsMatch: null,
+      geniusMatch: null,
+      overall: null
+    };
+  }
+
+  const mbtiMatch = scoreMbtiAlignment(profile.mbti, known.mbti);
+  const discMatch = scoreDiscAlignment(profile.disc, known.disc);
+  const strengthsMatch = scoreListAlignment(profile.strengths.topTwo, known.strengths, STRENGTH_KEY_ALIASES);
+  const geniusMatch = scoreListAlignment(profile.workingGenius.topTwo, known.workingGenius, GENIUS_KEY_ALIASES);
+
+  const measures = [mbtiMatch, discMatch, strengthsMatch, geniusMatch].filter(
+    (x) => x && Number.isFinite(x.score)
+  );
+
+  const overallScore = measures.length
+    ? Math.round(measures.reduce((sum, measure) => sum + measure.score, 0) / measures.length)
+    : null;
+
+  const overallBand = overallScore === null
+    ? "N/A"
+    : overallScore >= 80
+      ? "High Alignment"
+      : overallScore >= 60
+        ? "Moderate Alignment"
+        : "Low Alignment";
+
+  return {
+    hasKnown: true,
+    known,
+    mbtiMatch,
+    discMatch,
+    strengthsMatch,
+    geniusMatch,
+    overall: overallScore === null ? null : { score: overallScore, band: overallBand }
+  };
+}
+
+function scoreMbtiAlignment(mbti, knownMbti) {
+  if (!knownMbti || knownMbti.length < 2) return null;
+
+  const predicted = String(mbti.type || "");
+  const known = String(knownMbti || "");
+  const len = Math.min(predicted.length, known.length, 4);
+  if (!len) return null;
+
+  let matched = 0;
+  for (let idx = 0; idx < len; idx += 1) {
+    const knownLetter = known[idx];
+    const predictedLetter = predicted[idx];
+    const isBalanced = mbti.pairs?.[idx]?.balanced;
+
+    if (knownLetter === predictedLetter) {
+      matched += 1;
+      continue;
+    }
+    if (isBalanced && "EISNTFJP".includes(knownLetter)) {
+      matched += 0.5;
+    }
+  }
+
+  const score = Math.round((matched / len) * 100);
+  return { score, detail: `${Math.round(matched * 10) / 10}/${len} letters aligned` };
+}
+
+function scoreDiscAlignment(disc, knownDisc) {
+  if (!knownDisc) return null;
+  const knownTokens = extractDiscTokens(knownDisc);
+  if (!knownTokens.length) return null;
+
+  const primary = String(disc.primary?.key || "");
+  const secondary = String(disc.secondary?.key || "");
+  const mappedPrimary = mapDiscKey(primary);
+  const mappedSecondary = mapDiscKey(secondary);
+
+  let score = 0;
+  if (knownTokens.includes(mappedPrimary)) score = 100;
+  else if (knownTokens.includes(mappedSecondary)) score = 70;
+  else score = 20;
+
+  const predicted = mappedSecondary ? `${mappedPrimary}/${mappedSecondary}` : mappedPrimary;
+  return { score, detail: `Known ${knownTokens.join("/")}, predicted ${predicted}` };
+}
+
+function extractDiscTokens(value) {
+  const v = String(value || "").toUpperCase();
+  const tokens = [];
+  if (v.includes("D")) tokens.push("D");
+  if (v.includes("I")) tokens.push("I");
+  if (v.includes("S")) tokens.push("S");
+  if (v.includes("C")) tokens.push("C");
+  return Array.from(new Set(tokens));
+}
+
+function mapDiscKey(key) {
+  if (key === "I_DISC") return "I";
+  if (key === "S_DISC") return "S";
+  return key;
+}
+
+function scoreListAlignment(predictedTopTwo, knownList, aliasMap) {
+  const knownKeys = knownList.map((label) => mapAliasToKey(label, aliasMap)).filter(Boolean);
+  if (!knownKeys.length) return null;
+
+  const predictedKeys = (predictedTopTwo || []).map((x) => x.key);
+  let matches = 0;
+
+  knownKeys.forEach((key) => {
+    if (predictedKeys.includes(key)) matches += 1;
+  });
+
+  const denom = Math.min(2, knownKeys.length);
+  const score = Math.round((matches / denom) * 100);
+  return { score, detail: `${matches}/${denom} top areas aligned` };
+}
+
+function mapAliasToKey(label, aliasMap) {
+  const key = String(label || "").trim().toLowerCase();
+  if (!key) return "";
+  return aliasMap[key] || "";
+}
+
+function formatCalibrationMeasure(measure) {
+  if (!measure) return "N/A";
+  return `${measure.score}% - ${measure.detail}`;
+}
+
+function explainDiscStyle(styleLabel) {
+  if (!styleLabel || styleLabel === "N/A") return "No DISC signal available.";
+  if (styleLabel.includes("Blend")) {
+    return "Shows a blended style with adaptable behavior across multiple communication modes.";
+  }
+  if (styleLabel === "Driver") {
+    return "Tends to move quickly, make decisions fast, and push for results.";
+  }
+  if (styleLabel === "Promoter") {
+    return "Builds momentum through communication and social influence.";
+  }
+  if (styleLabel === "Stabilizer") {
+    return "Provides consistency, reliability, and calm follow-through.";
+  }
+  if (styleLabel === "Analyzer") {
+    return "Prioritizes quality, logic, detail, and risk control.";
+  }
+  return "Custom style blend identified.";
+}
+
+function explainPattern(patternLabel) {
+  if (!patternLabel || patternLabel === "N/A") return "No clear pattern signal available.";
+  return `Primary pattern indicates a likely preference for ${patternLabel.toLowerCase()} work.`;
+}
+
+function formatList(values, fallback = "None") {
+  if (!Array.isArray(values) || values.length === 0) return fallback;
+  const clean = values.map((x) => String(x || "").trim()).filter(Boolean);
+  return clean.length ? clean.join(", ") : fallback;
+}
+
 function createSubmissionId() {
   return `pers_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -684,6 +912,17 @@ async function trySendSubmissionEmail(record) {
 function formatSubmissionEmail(record) {
   const p = record.profile;
   const i = p.interpretation || {};
+  const calibration = p.calibration || {};
+  const known = calibration.known || normalizeKnownAssessments(record.knownAssessments || {});
+  const calibrationOverall = calibration.overall
+    ? `${calibration.overall.score}% (${calibration.overall.band})`
+    : "N/A";
+  const discStyle = i.discStyle || "N/A";
+  const strengthsPattern = i.strengthsPattern || "N/A";
+  const geniusPattern = i.workingGeniusPattern || "N/A";
+  const interviewFocus = Array.isArray(i.interviewFocus) && i.interviewFocus.length
+    ? i.interviewFocus.join(" | ")
+    : "None";
 
   const mbtiSummary = p.mbti.pairs
     .map((x) => `${x.left}/${x.right} winner ${x.winner} (margin ${x.margin}%)`)
@@ -705,17 +944,33 @@ function formatSubmissionEmail(record) {
     `Rapid Completion Flag: ${p.rapidFlag ? "Yes" : "No"}`,
     `MBTI-Inspired Type: ${p.mbti.typeDisplay || p.mbti.type} (${p.mbti.confidence || "Clear"})`,
     `DISC Primary: ${p.disc.primary.label} (${p.disc.primary.pct}%)`,
-    `DISC Style: ${i.discStyle || "N/A"}`,
+    `DISC Style: ${discStyle}`,
     `Profile Type: ${i.profileType || "N/A"}`,
-    `Strengths Pattern: ${i.strengthsPattern || "N/A"}`,
-    `Working Genius Pattern: ${i.workingGeniusPattern || "N/A"}`,
-    `Fit Tags: ${(i.fitTags || []).join(", ") || "None"}`,
-    `Interview Focus: ${(i.interviewFocus || []).join(" | ") || "None"}`,
-    `Risk Flags: ${(i.riskFlags || []).join(", ") || "None"}`,
+    `Strengths Pattern: ${strengthsPattern}`,
+    `Working Genius Pattern: ${geniusPattern}`,
+    `Fit Tags: ${formatList(i.fitTags)}`,
+    `Interview Focus: ${interviewFocus}`,
+    `Risk Flags: ${formatList(i.riskFlags)}`,
     `Top Strength Domains: ${p.strengths.topTwo.map((x) => x.label).join(", ")}`,
     `Top Working Genius: ${p.workingGenius.topTwo.map((x) => x.label).join(", ")}`,
     `Lower-Energy Genius Areas: ${p.workingGenius.lowerEnergyTwo.map((x) => x.label).join(", ")}`,
     `Primary Archetype: ${p.primaryArchetype.label} (${Math.round(p.primaryArchetype.score)}%)`,
+    "",
+    "Calibration Against Known Assessments",
+    `Known MBTI: ${known.mbti || "N/A"}`,
+    `Known DISC: ${known.disc || "N/A"}`,
+    `Known Strengths: ${formatList(known.strengths)}`,
+    `Known Working Genius: ${formatList(known.workingGenius)}`,
+    `Overall Alignment: ${calibrationOverall}`,
+    `MBTI Match: ${formatCalibrationMeasure(calibration.mbtiMatch)}`,
+    `DISC Match: ${formatCalibrationMeasure(calibration.discMatch)}`,
+    `Strengths Match: ${formatCalibrationMeasure(calibration.strengthsMatch)}`,
+    `Working Genius Match: ${formatCalibrationMeasure(calibration.geniusMatch)}`,
+    "",
+    "Interpretation Notes",
+    `DISC Explanation: ${explainDiscStyle(discStyle)}`,
+    `Strengths Explanation: ${explainPattern(strengthsPattern)}`,
+    `Working Genius Explanation: ${explainPattern(geniusPattern)}`,
     "",
     `MBTI Pair Detail: ${mbtiSummary}`,
     `DISC Detail: ${discSummary}`,
@@ -756,7 +1011,22 @@ function buildSubmissionCsv(rows) {
     "primaryArchetype",
     "primaryArchetypeScore",
     "fitTags",
-    "riskFlags"
+    "interviewFocus",
+    "riskFlags",
+    "knownMbti",
+    "knownDisc",
+    "knownStrengths",
+    "knownWorkingGenius",
+    "calibrationOverallScore",
+    "calibrationOverallBand",
+    "calibrationMbtiScore",
+    "calibrationMbtiDetail",
+    "calibrationDiscScore",
+    "calibrationDiscDetail",
+    "calibrationStrengthsScore",
+    "calibrationStrengthsDetail",
+    "calibrationGeniusScore",
+    "calibrationGeniusDetail"
   ];
 
   const lines = [headers.join(",")];
@@ -767,6 +1037,8 @@ function buildSubmissionCsv(rows) {
     const disc = p.disc || {};
     const strengths = p.strengths || {};
     const genius = p.workingGenius || {};
+    const calibration = p.calibration || {};
+    const known = calibration.known || normalizeKnownAssessments(record.knownAssessments || {});
 
     const row = [
       record.submissionId,
@@ -797,7 +1069,22 @@ function buildSubmissionCsv(rows) {
       p.primaryArchetype?.label,
       p.primaryArchetype ? Math.round(p.primaryArchetype.score) : "",
       (i.fitTags || []).join("|"),
-      (i.riskFlags || []).join("|")
+      (i.interviewFocus || []).join("|"),
+      (i.riskFlags || []).join("|"),
+      known.mbti || "",
+      known.disc || "",
+      (known.strengths || []).join("|"),
+      (known.workingGenius || []).join("|"),
+      calibration.overall?.score ?? "",
+      calibration.overall?.band ?? "",
+      calibration.mbtiMatch?.score ?? "",
+      calibration.mbtiMatch?.detail ?? "",
+      calibration.discMatch?.score ?? "",
+      calibration.discMatch?.detail ?? "",
+      calibration.strengthsMatch?.score ?? "",
+      calibration.strengthsMatch?.detail ?? "",
+      calibration.geniusMatch?.score ?? "",
+      calibration.geniusMatch?.detail ?? ""
     ];
 
     lines.push(row.map(csvEscape).join(","));
