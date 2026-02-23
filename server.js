@@ -162,6 +162,13 @@ const TOTAL_QUESTIONS = QUESTION_KEY.length;
 const MAX_LIMIT = 5000;
 const MAX_NAME_LEN = 120;
 const MAX_TEST_VERSION_LEN = 60;
+const MIN_ANSWERED_REQUIRED = Number(process.env.MIN_ANSWERED_REQUIRED || 40);
+const MIN_REQUIRED = Math.max(1, Math.min(TOTAL_QUESTIONS, Math.floor(MIN_ANSWERED_REQUIRED)));
+const WG_BUCKET_WEIGHTS = {
+  genius: 0.55,
+  competency: 0.3,
+  frustrationRelief: 0.15
+};
 const REQUIRE_SUBMISSION_API_KEY = parseBoolEnv("REQUIRE_SUBMISSION_API_KEY", false);
 const RATE_WINDOW_MS = Number(process.env.RATE_WINDOW_MS || 10 * 60 * 1000);
 const RATE_MAX_SUBMISSIONS = Number(process.env.RATE_MAX_SUBMISSIONS || 30);
@@ -225,6 +232,18 @@ app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "personality-assessment-backend" });
+});
+
+app.get("/admin", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "admin.html"));
+});
+
+app.get("/admin.js", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "admin.js"));
+});
+
+app.get("/admin.css", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "admin.css"));
 });
 
 app.post("/api/submissions", async (req, res) => {
@@ -380,6 +399,11 @@ function validateSubmission(input) {
     answers[q.id] = Number.isInteger(value) && value >= 1 && value <= 5 ? value : 0;
   });
 
+  const answeredCount = Object.values(answers).filter((value) => value >= 1 && value <= 5).length;
+  if (answeredCount < MIN_REQUIRED) {
+    fail(400, `Please answer at least ${MIN_REQUIRED} questions before submitting.`);
+  }
+
   return {
     candidateName,
     candidateEmail,
@@ -442,6 +466,7 @@ function scoreProfile(answers, durationMinutes, knownAssessments) {
   const discRanking = rankTraits(["D", "I_DISC", "S_DISC", "C"], traitTotals);
   const strengthsRanking = rankTraits(["EXEC", "INFL", "REL", "STRAT"], traitTotals);
   const geniusRanking = rankTraits(["WG_W", "WG_I", "WG_D", "WG_G", "WG_E", "WG_T"], traitTotals);
+  const geniusBuckets = buildWorkingGeniusBuckets(geniusRanking);
 
   const archetypes = [
     {
@@ -488,11 +513,7 @@ function scoreProfile(answers, durationMinutes, knownAssessments) {
       ranking: strengthsRanking,
       topTwo: strengthsRanking.slice(0, 2)
     },
-    workingGenius: {
-      ranking: geniusRanking,
-      topTwo: geniusRanking.slice(0, 2),
-      lowerEnergyTwo: geniusRanking.slice(-2).reverse()
-    },
+    workingGenius: geniusBuckets,
     archetypes,
     primaryArchetype: archetypes[0]
   };
@@ -535,6 +556,41 @@ function averagePct(traits, traitTotals) {
   if (!traits.length) return 0;
   const total = traits.reduce((sum, trait) => sum + (traitTotals[trait]?.pct || 0), 0);
   return total / traits.length;
+}
+
+function averageRankingPct(items) {
+  if (!Array.isArray(items) || !items.length) return 0;
+  const total = items.reduce((sum, item) => sum + Number(item.pct || 0), 0);
+  return total / items.length;
+}
+
+function buildWorkingGeniusBuckets(ranking) {
+  const sorted = Array.isArray(ranking) ? [...ranking] : [];
+  const genius = sorted.slice(0, 2);
+  const competency = sorted.slice(2, 4);
+  const frustration = sorted.slice(4, 6);
+
+  const geniusAvg = averageRankingPct(genius);
+  const competencyAvg = averageRankingPct(competency);
+  const frustrationAvg = averageRankingPct(frustration);
+  const weightedScore = Math.round(
+    (geniusAvg * WG_BUCKET_WEIGHTS.genius) +
+    (competencyAvg * WG_BUCKET_WEIGHTS.competency) +
+    ((100 - frustrationAvg) * WG_BUCKET_WEIGHTS.frustrationRelief)
+  );
+
+  return {
+    ranking: sorted,
+    genius,
+    competency,
+    frustration,
+    bucketAverages: {
+      genius: Math.round(geniusAvg),
+      competency: Math.round(competencyAvg),
+      frustration: Math.round(frustrationAvg)
+    },
+    weightedScore: clampPct(weightedScore)
+  };
 }
 
 function deriveInterpretation(profile) {
@@ -580,11 +636,11 @@ function classifyStrengthsPattern(strengths) {
 }
 
 function classifyGeniusPattern(workingGenius) {
-  const topTwo = workingGenius.topTwo || [];
-  if (topTwo.length < 2) return { patternLabel: topTwo[0]?.label || "N/A" };
+  const genius = workingGenius.genius || [];
+  if (genius.length < 2) return { patternLabel: genius[0]?.label || "N/A" };
 
-  const pair = buildPairKey(topTwo[0].key, topTwo[1].key);
-  const patternLabel = GENIUS_PAIR_LABELS[pair] || `${topTwo[0].label} + ${topTwo[1].label}`;
+  const pair = buildPairKey(genius[0].key, genius[1].key);
+  const patternLabel = GENIUS_PAIR_LABELS[pair] || `${genius[0].label} + ${genius[1].label}`;
   return { patternLabel };
 }
 
@@ -592,7 +648,7 @@ function deriveFitTags(profile) {
   const tags = [];
   const discPrimaryKey = profile.disc.primary?.key || "";
   const topStrengthKeys = (profile.strengths.topTwo || []).map((x) => x.key);
-  const topGeniusKeys = (profile.workingGenius.topTwo || []).map((x) => x.key);
+  const topGeniusKeys = (profile.workingGenius.genius || []).map((x) => x.key);
 
   if ((discPrimaryKey === "D" || discPrimaryKey === "C") && topStrengthKeys.includes("EXEC")) {
     tags.push("Ops Execution");
@@ -649,6 +705,9 @@ function deriveRiskFlags(profile, discStyle) {
     const spread = Number(geniusRanking[0].pct || 0) - Number(geniusRanking[geniusRanking.length - 1].pct || 0);
     if (spread < 12) flags.push("Working Genius profile is relatively flat");
   }
+  if (Number(profile.workingGenius.bucketAverages?.frustration || 0) >= 60) {
+    flags.push("High frustration load in Working Genius profile");
+  }
 
   return flags;
 }
@@ -700,7 +759,7 @@ function deriveCalibration(profile, knownAssessments) {
   const mbtiMatch = scoreMbtiAlignment(profile.mbti, known.mbti);
   const discMatch = scoreDiscAlignment(profile.disc, known.disc);
   const strengthsMatch = scoreListAlignment(profile.strengths.topTwo, known.strengths, STRENGTH_KEY_ALIASES);
-  const geniusMatch = scoreListAlignment(profile.workingGenius.topTwo, known.workingGenius, GENIUS_KEY_ALIASES);
+  const geniusMatch = scoreListAlignment(profile.workingGenius.genius, known.workingGenius, GENIUS_KEY_ALIASES);
 
   const measures = [mbtiMatch, discMatch, strengthsMatch, geniusMatch].filter(
     (x) => x && Number.isFinite(x.score)
@@ -895,7 +954,10 @@ function filterByTestVersion(rows, testVersion) {
 async function trySendSubmissionEmail(record) {
   if (!canSendEmail()) return false;
 
-  const subject = `Personality Submission [${record.testVersion}] - ${record.candidateName} - ${record.profile.mbti.type}`;
+  const safeName = record.candidateName || "Unknown Candidate";
+  const safeEmail = record.candidateEmail || "no-email";
+  const safeType = record.profile?.mbti?.type || "N/A";
+  const subject = `Personality Submission [${record.testVersion}] - ${safeName} <${safeEmail}> - ${safeType}`;
   const body = formatSubmissionEmail(record);
 
   await sendViaGmailApi({
@@ -931,6 +993,9 @@ function formatSubmissionEmail(record) {
   const discSummary = p.disc.ranking.map((x) => `${x.label} ${x.pct}%`).join(", ");
   const strengthsSummary = p.strengths.ranking.map((x) => `${x.label} ${x.pct}%`).join(", ");
   const geniusSummary = p.workingGenius.ranking.map((x) => `${x.label} ${x.pct}%`).join(", ");
+  const geniusAreas = (p.workingGenius.genius || []).map((x) => x.label).join(", ");
+  const competencyAreas = (p.workingGenius.competency || []).map((x) => x.label).join(", ");
+  const frustrationAreas = (p.workingGenius.frustration || []).map((x) => x.label).join(", ");
 
   return [
     `Submission ID: ${record.submissionId}`,
@@ -952,8 +1017,10 @@ function formatSubmissionEmail(record) {
     `Interview Focus: ${interviewFocus}`,
     `Risk Flags: ${formatList(i.riskFlags)}`,
     `Top Strength Domains: ${p.strengths.topTwo.map((x) => x.label).join(", ")}`,
-    `Top Working Genius: ${p.workingGenius.topTwo.map((x) => x.label).join(", ")}`,
-    `Lower-Energy Genius Areas: ${p.workingGenius.lowerEnergyTwo.map((x) => x.label).join(", ")}`,
+    `Working Genius (Genius): ${geniusAreas || "None"}`,
+    `Working Genius (Competency): ${competencyAreas || "None"}`,
+    `Working Genius (Frustration): ${frustrationAreas || "None"}`,
+    `Working Genius Weighted Score: ${p.workingGenius.weightedScore ?? 0}%`,
     `Primary Archetype: ${p.primaryArchetype.label} (${Math.round(p.primaryArchetype.score)}%)`,
     "",
     "Calibration Against Known Assessments",
@@ -1004,10 +1071,13 @@ function buildSubmissionCsv(rows) {
     "strengthTopOne",
     "strengthTopTwo",
     "workingGeniusPattern",
-    "geniusTopOne",
-    "geniusTopTwo",
-    "geniusLowOne",
-    "geniusLowTwo",
+    "wgGeniusOne",
+    "wgGeniusTwo",
+    "wgCompetencyOne",
+    "wgCompetencyTwo",
+    "wgFrustrationOne",
+    "wgFrustrationTwo",
+    "wgWeightedScore",
     "primaryArchetype",
     "primaryArchetypeScore",
     "fitTags",
@@ -1062,10 +1132,13 @@ function buildSubmissionCsv(rows) {
       strengths.topTwo?.[0]?.label,
       strengths.topTwo?.[1]?.label,
       i.workingGeniusPattern,
-      genius.topTwo?.[0]?.label,
-      genius.topTwo?.[1]?.label,
-      genius.lowerEnergyTwo?.[0]?.label,
-      genius.lowerEnergyTwo?.[1]?.label,
+      genius.genius?.[0]?.label,
+      genius.genius?.[1]?.label,
+      genius.competency?.[0]?.label,
+      genius.competency?.[1]?.label,
+      genius.frustration?.[0]?.label,
+      genius.frustration?.[1]?.label,
+      genius.weightedScore ?? "",
       p.primaryArchetype?.label,
       p.primaryArchetype ? Math.round(p.primaryArchetype.score) : "",
       (i.fitTags || []).join("|"),
@@ -1270,6 +1343,12 @@ function csvEscape(value) {
   }
   if (/[",\n]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
   return text;
+}
+
+function clampPct(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, n));
 }
 
 function parseBoolEnv(name, fallback) {
