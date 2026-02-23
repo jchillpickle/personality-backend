@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Personality Admin Dashboard</title>
+  <link rel="stylesheet" href="/admin.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="card">
+      <h1>Personality Assessment Admin Dashboard</h1>
+      <p>Private dashboard for reviewing candidate submissions, calibration, and profile graphs.</p>
+    </header>
+
+    <section class="card controls">
+      <label>API Key
+        <input id="apiKey" type="password" placeholder="Render API_KEY" />
+      </label>
+      <label>Limit
+        <input id="limit" type="number" min="1" max="500" value="100" />
+      </label>
+      <label>Test Version
+        <input id="testVersion" type="text" value="personality-v1-52q" />
+      </label>
+      <div class="actions">
+        <button id="loadBtn" type="button">Load Records</button>
+        <button id="downloadBtn" type="button">Download CSV</button>
+      </div>
+      <p id="status" class="small muted">Enter API key and load records.</p>
+    </section>
+
+    <section class="layout">
+      <aside class="card list-panel">
+        <h2>Submissions</h2>
+        <div id="recordsList" class="records-list"></div>
+      </aside>
+
+      <section class="card detail-panel">
+        <h2>Profile Detail</h2>
+        <div id="recordDetail" class="empty">Select a submission to view details.</div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/admin.js"></script>
+</body>
+</html>
