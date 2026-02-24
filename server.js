@@ -229,6 +229,10 @@ app.use(
 );
 
 app.use(express.json({ limit: "1mb" }));
+app.use(express.text({
+  type: ["text/csv", "application/csv", "text/plain"],
+  limit: "10mb"
+}));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "personality-assessment-backend" });
@@ -321,6 +325,65 @@ app.get("/api/admin/submissions/download", async (req, res) => {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="personality-submissions-${stamp}.csv"`);
     res.send(csv);
+  } catch (error) {
+    const status = error?.statusCode || 500;
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(status).json({ ok: false, error: message });
+  }
+});
+
+app.post("/api/admin/submissions/import", async (req, res) => {
+  try {
+    enforceRateLimit(req, "admin-import", RATE_MAX_ADMIN, RATE_WINDOW_MS);
+    requireApiKey(req);
+
+    const mode = normalizeImportMode(req.query.mode ?? req.body?.mode);
+    const csv = extractImportCsv(req.body);
+    const parsedRows = parseCsvRecords(csv);
+    if (parsedRows.length <= 1) {
+      fail(400, "CSV does not contain any data rows.");
+    }
+
+    const importedRecords = buildImportedRecords(parsedRows);
+    if (!importedRecords.length) {
+      fail(400, "No valid records found in CSV.");
+    }
+
+    let currentRows = [];
+    if (mode === "append") {
+      currentRows = await readSubmissions(Number.MAX_SAFE_INTEGER);
+    }
+
+    const seenIds = new Set(currentRows.map((x) => String(x.submissionId || "")));
+    const accepted = [];
+    let skippedDuplicates = 0;
+
+    importedRecords.forEach((record) => {
+      const id = String(record.submissionId || "");
+      if (seenIds.has(id)) {
+        skippedDuplicates += 1;
+        return;
+      }
+      seenIds.add(id);
+      accepted.push(record);
+    });
+
+    if (mode === "replace") {
+      await writeSubmissions(accepted);
+    } else {
+      await appendSubmissions(accepted);
+    }
+
+    const totalAfter = mode === "replace" ? accepted.length : currentRows.length + accepted.length;
+
+    res.json({
+      ok: true,
+      mode,
+      parsedRows: parsedRows.length - 1,
+      imported: accepted.length,
+      skippedDuplicates,
+      totalAfter
+    });
   } catch (error) {
     const status = error?.statusCode || 500;
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -926,6 +989,21 @@ async function appendSubmission(record) {
   await fs.appendFile(target, `${JSON.stringify(record)}\n`, "utf8");
 }
 
+async function appendSubmissions(records) {
+  if (!Array.isArray(records) || records.length === 0) return;
+  const target = storePath();
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const payload = records.map((record) => JSON.stringify(record)).join("\n");
+  await fs.appendFile(target, `${payload}\n`, "utf8");
+}
+
+async function writeSubmissions(records) {
+  const target = storePath();
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const payload = (records || []).map((record) => JSON.stringify(record)).join("\n");
+  await fs.writeFile(target, payload ? `${payload}\n` : "", "utf8");
+}
+
 async function readSubmissions(limit) {
   const target = storePath();
   const raw = await fs.readFile(target, "utf8").catch(() => "");
@@ -1170,6 +1248,286 @@ function parseLimit(value, fallback) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.min(Math.floor(parsed), MAX_LIMIT);
+}
+
+function normalizeImportMode(value) {
+  const mode = String(value || "append").trim().toLowerCase();
+  if (!["append", "replace"].includes(mode)) {
+    fail(400, "Invalid import mode. Use append or replace.");
+  }
+  return mode;
+}
+
+function extractImportCsv(body) {
+  if (typeof body === "string") {
+    return body;
+  }
+  if (body && typeof body === "object" && typeof body.csv === "string") {
+    return body.csv;
+  }
+  fail(400, "Send CSV as text/csv body or JSON { csv: \"...\" }.");
+}
+
+function parseCsvRecords(csvText) {
+  const text = String(csvText || "").replace(/^\uFEFF/, "");
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let idx = 0; idx < text.length; idx += 1) {
+    const ch = text[idx];
+
+    if (inQuotes) {
+      if (ch === "\"") {
+        if (text[idx + 1] === "\"") {
+          field += "\"";
+          idx += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+
+    if (ch === "\"") {
+      inQuotes = true;
+      continue;
+    }
+    if (ch === ",") {
+      row.push(field);
+      field = "";
+      continue;
+    }
+    if (ch === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+      continue;
+    }
+    if (ch === "\r") continue;
+    field += ch;
+  }
+
+  row.push(field);
+  rows.push(row);
+
+  return rows.filter((cells) => cells.some((value) => String(value || "").trim() !== ""));
+}
+
+function buildImportedRecords(parsedRows) {
+  const headers = parsedRows[0].map((x) => String(x || "").trim());
+  const rows = parsedRows.slice(1);
+
+  return rows
+    .map((cells, idx) => {
+      const row = {};
+      headers.forEach((header, colIdx) => {
+        row[header] = String(cells[colIdx] ?? "");
+      });
+      return buildImportedRecord(row, idx);
+    })
+    .filter(Boolean);
+}
+
+function buildImportedRecord(row, idx) {
+  const nowIso = new Date().toISOString();
+  const submissionId = String(row.submissionId || "").trim() || `import_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+  const testVersion = normalizeTestVersion(row.testVersion || DEFAULT_TEST_VERSION);
+  const knownAssessments = normalizeKnownAssessments({
+    mbti: row.knownMbti,
+    disc: row.knownDisc,
+    strengths: splitPipeList(row.knownStrengths),
+    workingGenius: splitPipeList(row.knownWorkingGenius)
+  });
+
+  const mbtiType = String(row.mbtiType || "").trim();
+  const mbtiLettersOnly = mbtiType.replace(/[^A-Z]/gi, "").slice(0, 4).toUpperCase();
+  const mbtiDisplay = mbtiType || mbtiLettersOnly || "N/A";
+
+  const discPrimaryLabel = String(row.discPrimary || "N/A").trim();
+  const discSecondaryLabel = String(row.discSecondary || "N/A").trim();
+  const strengthTopOne = String(row.strengthTopOne || "N/A").trim();
+  const strengthTopTwo = String(row.strengthTopTwo || "N/A").trim();
+  const wgGeniusOne = String(row.wgGeniusOne || "N/A").trim();
+  const wgGeniusTwo = String(row.wgGeniusTwo || "N/A").trim();
+  const wgCompetencyOne = String(row.wgCompetencyOne || "N/A").trim();
+  const wgCompetencyTwo = String(row.wgCompetencyTwo || "N/A").trim();
+  const wgFrustrationOne = String(row.wgFrustrationOne || "N/A").trim();
+  const wgFrustrationTwo = String(row.wgFrustrationTwo || "N/A").trim();
+  const wgWeightedScore = clampPct(parseOptionalNumber(row.wgWeightedScore, 0));
+
+  const profile = {
+    answeredCount: parseOptionalInt(row.answeredCount, 0),
+    totalQuestions: parseOptionalInt(row.totalQuestions, TOTAL_QUESTIONS),
+    completionPct: clampPct(parseOptionalNumber(row.completionPct, 0)),
+    rapidFlag: parseOptionalBool(row.rapidFlag, false),
+    traitTotals: {},
+    mbti: {
+      type: mbtiLettersOnly || "N/A",
+      typeDisplay: mbtiDisplay,
+      confidence: String(row.mbtiConfidence || "Imported").trim() || "Imported",
+      balanceCount: mbtiDisplay.includes("X") ? (mbtiDisplay.match(/X/g) || []).length : 0,
+      pairs: []
+    },
+    disc: {
+      ranking: [
+        { key: "D", label: "Dominance", pct: 0, avg: 0 },
+        { key: "I_DISC", label: "Influence", pct: 0, avg: 0 },
+        { key: "S_DISC", label: "Steadiness", pct: 0, avg: 0 },
+        { key: "C", label: "Conscientiousness", pct: 0, avg: 0 }
+      ],
+      primary: { key: "", label: discPrimaryLabel || "N/A", pct: 0, avg: 0 },
+      secondary: { key: "", label: discSecondaryLabel || "N/A", pct: 0, avg: 0 }
+    },
+    strengths: {
+      ranking: [
+        { key: "EXEC", label: "Executing", pct: 0, avg: 0 },
+        { key: "INFL", label: "Influencing", pct: 0, avg: 0 },
+        { key: "REL", label: "Relationship Building", pct: 0, avg: 0 },
+        { key: "STRAT", label: "Strategic Thinking", pct: 0, avg: 0 }
+      ],
+      topTwo: [
+        { key: "", label: strengthTopOne || "N/A", pct: 0, avg: 0 },
+        { key: "", label: strengthTopTwo || "N/A", pct: 0, avg: 0 }
+      ]
+    },
+    workingGenius: {
+      ranking: [
+        { key: "WG_W", label: "Wonder", pct: 0, avg: 0 },
+        { key: "WG_I", label: "Invention", pct: 0, avg: 0 },
+        { key: "WG_D", label: "Discernment", pct: 0, avg: 0 },
+        { key: "WG_G", label: "Galvanizing", pct: 0, avg: 0 },
+        { key: "WG_E", label: "Enablement", pct: 0, avg: 0 },
+        { key: "WG_T", label: "Tenacity", pct: 0, avg: 0 }
+      ],
+      genius: [
+        { key: "", label: wgGeniusOne || "N/A", pct: 0, avg: 0 },
+        { key: "", label: wgGeniusTwo || "N/A", pct: 0, avg: 0 }
+      ],
+      competency: [
+        { key: "", label: wgCompetencyOne || "N/A", pct: 0, avg: 0 },
+        { key: "", label: wgCompetencyTwo || "N/A", pct: 0, avg: 0 }
+      ],
+      frustration: [
+        { key: "", label: wgFrustrationOne || "N/A", pct: 0, avg: 0 },
+        { key: "", label: wgFrustrationTwo || "N/A", pct: 0, avg: 0 }
+      ],
+      bucketAverages: {
+        genius: 0,
+        competency: 0,
+        frustration: 0
+      },
+      weightedScore: wgWeightedScore
+    },
+    archetypes: [
+      {
+        label: String(row.primaryArchetype || "Imported Profile").trim() || "Imported Profile",
+        score: clampPct(parseOptionalNumber(row.primaryArchetypeScore, 0)),
+        summary: "Imported from CSV summary."
+      }
+    ],
+    primaryArchetype: {
+      label: String(row.primaryArchetype || "Imported Profile").trim() || "Imported Profile",
+      score: clampPct(parseOptionalNumber(row.primaryArchetypeScore, 0)),
+      summary: "Imported from CSV summary."
+    },
+    interpretation: {
+      profileType: String(row.profileType || "Imported Profile").trim() || "Imported Profile",
+      discStyle: String(row.discStyle || "Imported").trim() || "Imported",
+      strengthsPattern: String(row.strengthsPattern || "Imported").trim() || "Imported",
+      workingGeniusPattern: String(row.workingGeniusPattern || "Imported").trim() || "Imported",
+      fitTags: splitPipeList(row.fitTags),
+      interviewFocus: splitPipeList(row.interviewFocus),
+      riskFlags: splitPipeList(row.riskFlags)
+    },
+    calibration: {
+      hasKnown: Boolean(
+        knownAssessments.mbti ||
+        knownAssessments.disc ||
+        knownAssessments.strengths.length ||
+        knownAssessments.workingGenius.length
+      ),
+      known: knownAssessments,
+      mbtiMatch: buildCalibrationMeasure(row.calibrationMbtiScore, row.calibrationMbtiDetail),
+      discMatch: buildCalibrationMeasure(row.calibrationDiscScore, row.calibrationDiscDetail),
+      strengthsMatch: buildCalibrationMeasure(row.calibrationStrengthsScore, row.calibrationStrengthsDetail),
+      geniusMatch: buildCalibrationMeasure(row.calibrationGeniusScore, row.calibrationGeniusDetail),
+      overall: buildCalibrationOverall(row.calibrationOverallScore, row.calibrationOverallBand)
+    }
+  };
+
+  return {
+    submissionId,
+    receivedAt: normalizeIsoDate(row.receivedAt, nowIso),
+    submittedAt: normalizeIsoDate(row.submittedAt, nowIso),
+    testVersion,
+    candidateName: String(row.candidateName || "Imported Candidate").trim() || "Imported Candidate",
+    candidateEmail: String(row.candidateEmail || "unknown@example.com").trim().toLowerCase() || "unknown@example.com",
+    durationMinutes: parseOptionalNumber(row.durationMinutes, 0),
+    autoSubmitted: false,
+    answers: {},
+    knownAssessments,
+    roleLabel: PROFILE_LABEL,
+    profile,
+    importedFromCsv: true
+  };
+}
+
+function splitPipeList(value) {
+  return String(value || "")
+    .split("|")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function parseOptionalNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return parsed;
+}
+
+function parseOptionalInt(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.floor(parsed));
+}
+
+function parseOptionalBool(value, fallback = false) {
+  const v = String(value || "").trim().toLowerCase();
+  if (!v) return fallback;
+  return ["1", "true", "yes", "on"].includes(v);
+}
+
+function normalizeIsoDate(value, fallbackIso) {
+  const text = String(value || "").trim();
+  if (!text) return fallbackIso;
+  const stamp = Date.parse(text);
+  if (!Number.isFinite(stamp)) return fallbackIso;
+  return new Date(stamp).toISOString();
+}
+
+function buildCalibrationMeasure(scoreRaw, detailRaw) {
+  const score = parseOptionalNumber(scoreRaw, Number.NaN);
+  const detail = String(detailRaw || "").trim();
+  if (!Number.isFinite(score) && !detail) return null;
+  return {
+    score: Number.isFinite(score) ? clampPct(score) : 0,
+    detail: detail || "Imported from CSV"
+  };
+}
+
+function buildCalibrationOverall(scoreRaw, bandRaw) {
+  const score = parseOptionalNumber(scoreRaw, Number.NaN);
+  const band = String(bandRaw || "").trim();
+  if (!Number.isFinite(score) && !band) return null;
+  return {
+    score: Number.isFinite(score) ? clampPct(score) : 0,
+    band: band || "Imported"
+  };
 }
 
 function canSendEmail() {
